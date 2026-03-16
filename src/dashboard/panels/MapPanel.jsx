@@ -1,84 +1,107 @@
-import { useState, useCallback, useRef } from 'react'
-import { GoogleMap, useJsApiLoader, Marker, InfoWindow, Circle } from '@react-google-maps/api'
+import { useState, useEffect, useRef } from 'react'
+import { MapContainer, TileLayer, Marker, Popup, Circle, useMap } from 'react-leaflet'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 
-// ── Replace with your real Google Maps API key ──────────────────────────────
-const GOOGLE_MAPS_API_KEY = 'YOUR_GOOGLE_MAPS_API_KEY'
-// ────────────────────────────────────────────────────────────────────────────
+// Fix default marker icons broken by Webpack/Vite
+delete L.Icon.Default.prototype._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  iconUrl:       'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl:     'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+})
 
-const MAP_CONTAINER_STYLE = { width: '100%', height: '100%' }
+const makeIcon = (color) => L.divIcon({
+  className: '',
+  html: `<div style="
+    width:18px;height:18px;border-radius:50%;
+    background:${color};border:2.5px solid #fff;
+    box-shadow:0 1px 4px rgba(0,0,0,0.35)">
+  </div>`,
+  iconSize: [18, 18],
+  iconAnchor: [9, 9],
+})
 
-const DEFAULT_CENTER = { lat: 40.7128, lng: -74.006 } // New York — changes to user location
+const userIcon = L.divIcon({
+  className: '',
+  html: `<div style="
+    width:16px;height:16px;border-radius:50%;
+    background:#4f46e5;border:3px solid #fff;
+    box-shadow:0 0 0 3px rgba(79,70,229,0.3)">
+  </div>`,
+  iconSize: [16, 16],
+  iconAnchor: [8, 8],
+})
 
-const NEARBY_BUSINESSES = [
-  { id: 1, name: 'TechHub Coworking', type: 'Coworking', lat: 40.7148, lng: -74.008, rating: 4.7, promo: '20% off first month', category: 'business' },
-  { id: 2, name: 'Brew & Code Café', type: 'Café', lat: 40.711, lng: -74.003, rating: 4.5, promo: 'Free WiFi + loyalty card', category: 'cafe' },
-  { id: 3, name: 'Metro Print Shop', type: 'Print & Design', lat: 40.716, lng: -74.012, rating: 4.2, promo: '15% off bulk orders', category: 'service' },
-  { id: 4, name: 'Nexus Networking Club', type: 'Networking', lat: 40.709, lng: -74.015, rating: 4.8, promo: 'Free guest pass this week', category: 'business' },
-  { id: 5, name: 'QuickShip Logistics', type: 'Logistics', lat: 40.718, lng: -74.001, rating: 4.3, promo: 'Same-day delivery deal', category: 'service' },
-  { id: 6, name: 'The Strategy Room', type: 'Consulting', lat: 40.707, lng: -74.009, rating: 4.6, promo: 'Free 30-min consultation', category: 'business' },
+const CATEGORY_COLORS = { business: '#4f46e5', cafe: '#f59e0b', service: '#10b981' }
+const CATEGORY_ICONS  = { business: '🏢', cafe: '☕', service: '🔧' }
+
+// Offsets relative to user location (degrees)
+const BIZ_OFFSETS = [
+  { id:1, name:'TechHub Coworking',    type:'Coworking',   category:'business', rating:4.7, promo:'20% off first month',        dlat: 0.002,  dlng: 0.003  },
+  { id:2, name:'Brew & Code Café',     type:'Café',        category:'cafe',     rating:4.5, promo:'Free WiFi + loyalty card',    dlat:-0.0015, dlng: 0.002  },
+  { id:3, name:'Metro Print Shop',     type:'Print',       category:'service',  rating:4.2, promo:'15% off bulk orders',         dlat: 0.003,  dlng:-0.004  },
+  { id:4, name:'Nexus Networking Club',type:'Networking',  category:'business', rating:4.8, promo:'Free guest pass this week',   dlat:-0.002,  dlng:-0.003  },
+  { id:5, name:'QuickShip Logistics',  type:'Logistics',   category:'service',  rating:4.3, promo:'Same-day delivery deal',      dlat: 0.004,  dlng: 0.001  },
+  { id:6, name:'The Strategy Room',    type:'Consulting',  category:'business', rating:4.6, promo:'Free 30-min consultation',    dlat:-0.003,  dlng: 0.004  },
 ]
 
-const CATEGORY_COLORS = {
-  business: '#4f46e5',
-  cafe:     '#f59e0b',
-  service:  '#10b981',
-}
-
-const CATEGORY_ICONS = { business: '🏢', cafe: '☕', service: '🔧' }
-
-const mapOptions = {
-  disableDefaultUI: false,
-  zoomControl: true,
-  streetViewControl: false,
-  mapTypeControl: false,
-  styles: [
-    { featureType: 'poi', elementType: 'labels', stylers: [{ visibility: 'off' }] },
-    { featureType: 'transit', stylers: [{ visibility: 'simplified' }] },
-  ],
+// Sub-component: re-centers map when position changes
+function Recenter({ pos }) {
+  const map = useMap()
+  useEffect(() => { if (pos) map.setView(pos, 15) }, [pos, map])
+  return null
 }
 
 export default function MapPanel() {
-  const [center, setCenter] = useState(DEFAULT_CENTER)
-  const [selected, setSelected] = useState(null)
-  const [filter, setFilter] = useState('all')
+  const [userPos, setUserPos]   = useState(null)   // [lat, lng]
   const [locating, setLocating] = useState(false)
-  const mapRef = useRef(null)
+  const [geoError, setGeoError] = useState('')
+  const [filter, setFilter]     = useState('all')
+  const [selected, setSelected] = useState(null)
+  const markerRefs              = useRef({})
 
-  const { isLoaded, loadError } = useJsApiLoader({
-    googleMapsApiKey: GOOGLE_MAPS_API_KEY,
-  })
+  const DEFAULT_POS = [40.7128, -74.006] // NYC fallback
 
-  const onMapLoad = useCallback((map) => { mapRef.current = map }, [])
-
-  const locateMe = () => {
-    if (!navigator.geolocation) return
+  const locate = () => {
+    if (!navigator.geolocation) {
+      setGeoError('Geolocation is not supported by your browser.')
+      return
+    }
     setLocating(true)
+    setGeoError('')
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude }
-        setCenter(loc)
-        mapRef.current?.panTo(loc)
-        mapRef.current?.setZoom(14)
+        setUserPos([pos.coords.latitude, pos.coords.longitude])
         setLocating(false)
       },
-      () => setLocating(false)
+      (err) => {
+        setGeoError('Location access denied. Showing default map.')
+        setUserPos(DEFAULT_POS)
+        setLocating(false)
+      },
+      { timeout: 8000 }
     )
   }
 
-  const filtered = filter === 'all'
-    ? NEARBY_BUSINESSES
-    : NEARBY_BUSINESSES.filter(b => b.category === filter)
+  // Auto-locate on mount
+  useEffect(() => { locate() }, [])
 
-  const activePromos = NEARBY_BUSINESSES.filter(b => b.promo)
+  const center = userPos || DEFAULT_POS
 
-  if (loadError) return (
-    <div className="flex items-center justify-center h-64 bg-red-50 rounded-xl border border-red-100">
-      <div className="text-center">
-        <p className="text-red-600 font-semibold">Failed to load Google Maps</p>
-        <p className="text-red-400 text-sm mt-1">Check your API key in MapPanel.jsx</p>
-      </div>
-    </div>
-  )
+  const businesses = BIZ_OFFSETS.map(b => ({
+    ...b,
+    lat: center[0] + b.dlat,
+    lng: center[1] + b.dlng,
+  }))
+
+  const filtered = filter === 'all' ? businesses : businesses.filter(b => b.category === filter)
+
+  const handleListClick = (biz) => {
+    setSelected(biz)
+    const ref = markerRefs.current[biz.id]
+    if (ref) ref.openPopup()
+  }
 
   return (
     <div className="space-y-6">
@@ -88,7 +111,7 @@ export default function MapPanel() {
           <h2 className="text-2xl font-bold text-gray-900">Map & Local Business Engagement</h2>
           <p className="text-gray-500 text-sm mt-1">Nearby businesses, local promotions and engagement opportunities</p>
         </div>
-        <button onClick={locateMe} disabled={locating}
+        <button onClick={locate} disabled={locating}
           className="flex items-center gap-2 bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold px-4 py-2 rounded-xl transition-colors disabled:opacity-60">
           {locating
             ? <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -97,12 +120,18 @@ export default function MapPanel() {
         </button>
       </div>
 
-      {/* Stats row */}
+      {geoError && (
+        <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 text-sm rounded-xl px-4 py-2">
+          ⚠️ {geoError}
+        </div>
+      )}
+
+      {/* Stats */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { label: 'Nearby Businesses', value: NEARBY_BUSINESSES.length, icon: '🏢' },
-          { label: 'Active Promotions', value: activePromos.length, icon: '🎁' },
-          { label: 'Engagement Score', value: '87%', icon: '📈' },
+          { label:'Nearby Businesses', value: businesses.length, icon:'🏢' },
+          { label:'Active Promotions',  value: businesses.filter(b=>b.promo).length, icon:'🎁' },
+          { label:'Engagement Score',   value:'87%', icon:'📈' },
         ].map(s => (
           <div key={s.label} className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm text-center">
             <span className="text-2xl">{s.icon}</span>
@@ -114,7 +143,7 @@ export default function MapPanel() {
 
       {/* Filter tabs */}
       <div className="flex gap-2 flex-wrap">
-        {[['all', 'All'], ['business', '🏢 Business'], ['cafe', '☕ Café'], ['service', '🔧 Service']].map(([val, label]) => (
+        {[['all','All'],['business','🏢 Business'],['cafe','☕ Café'],['service','🔧 Service']].map(([val,label]) => (
           <button key={val} onClick={() => setFilter(val)}
             className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-colors border
               ${filter === val
@@ -125,85 +154,59 @@ export default function MapPanel() {
         ))}
       </div>
 
-      {/* Map + sidebar layout */}
+      {/* Map + list */}
       <div className="grid lg:grid-cols-3 gap-4">
-        {/* Map */}
-        <div className="lg:col-span-2 bg-gray-100 rounded-2xl overflow-hidden border border-gray-200 shadow-sm" style={{ height: 420 }}>
-          {!isLoaded ? (
-            <div className="w-full h-full flex items-center justify-center">
-              <div className="text-center">
-                <div className="w-8 h-8 border-2 border-brand-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
-                <p className="text-gray-500 text-sm">Loading map...</p>
-              </div>
-            </div>
-          ) : (
-            <GoogleMap
-              mapContainerStyle={MAP_CONTAINER_STYLE}
-              center={center}
-              zoom={14}
-              options={mapOptions}
-              onLoad={onMapLoad}
-            >
-              {/* Radius circle */}
-              <Circle
-                center={center}
-                radius={800}
-                options={{
-                  fillColor: '#4f46e5',
-                  fillOpacity: 0.06,
-                  strokeColor: '#4f46e5',
-                  strokeOpacity: 0.3,
-                  strokeWeight: 1.5,
-                }}
-              />
+        {/* Leaflet Map */}
+        <div className="lg:col-span-2 rounded-2xl overflow-hidden border border-gray-200 shadow-sm" style={{ height: 420 }}>
+          <MapContainer center={center} zoom={15} style={{ width:'100%', height:'100%' }} scrollWheelZoom>
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            />
+            <Recenter pos={userPos} />
 
-              {/* Business markers */}
-              {filtered.map(biz => (
-                <Marker
-                  key={biz.id}
-                  position={{ lat: biz.lat, lng: biz.lng }}
-                  onClick={() => setSelected(biz)}
-                  icon={{
-                    path: window.google.maps.SymbolPath.CIRCLE,
-                    scale: 10,
-                    fillColor: CATEGORY_COLORS[biz.category],
-                    fillOpacity: 1,
-                    strokeColor: '#fff',
-                    strokeWeight: 2,
-                  }}
-                />
-              ))}
+            {/* User location */}
+            {userPos && (
+              <>
+                <Marker position={userPos} icon={userIcon}>
+                  <Popup><strong>You are here</strong></Popup>
+                </Marker>
+                <Circle center={userPos} radius={800}
+                  pathOptions={{ color:'#4f46e5', fillColor:'#4f46e5', fillOpacity:0.06, weight:1.5 }} />
+              </>
+            )}
 
-              {/* Info window */}
-              {selected && (
-                <InfoWindow
-                  position={{ lat: selected.lat, lng: selected.lng }}
-                  onCloseClick={() => setSelected(null)}
-                >
-                  <div className="p-1 min-w-[180px]">
-                    <p className="font-bold text-gray-900 text-sm">{selected.name}</p>
-                    <p className="text-gray-500 text-xs mt-0.5">{selected.type}</p>
-                    <div className="flex items-center gap-1 mt-1">
-                      <span className="text-yellow-400 text-xs">★</span>
-                      <span className="text-xs text-gray-600">{selected.rating}</span>
-                    </div>
-                    {selected.promo && (
-                      <div className="mt-2 bg-green-50 border border-green-200 rounded px-2 py-1">
-                        <p className="text-green-700 text-xs font-semibold">🎁 {selected.promo}</p>
-                      </div>
+            {/* Business markers */}
+            {filtered.map(biz => (
+              <Marker
+                key={biz.id}
+                position={[biz.lat, biz.lng]}
+                icon={makeIcon(CATEGORY_COLORS[biz.category])}
+                ref={el => { if (el) markerRefs.current[biz.id] = el }}
+                eventHandlers={{ click: () => setSelected(biz) }}
+              >
+                <Popup>
+                  <div className="min-w-[160px]">
+                    <p className="font-bold text-gray-900 text-sm">{biz.name}</p>
+                    <p className="text-gray-500 text-xs mt-0.5">{biz.type}</p>
+                    <p className="text-xs mt-1">⭐ {biz.rating}</p>
+                    {biz.promo && (
+                      <p className="text-green-700 text-xs font-semibold mt-1.5 bg-green-50 px-2 py-1 rounded">
+                        🎁 {biz.promo}
+                      </p>
                     )}
                   </div>
-                </InfoWindow>
-              )}
-            </GoogleMap>
-          )}
+                </Popup>
+              </Marker>
+            ))}
+          </MapContainer>
         </div>
 
         {/* Business list */}
         <div className="space-y-2 overflow-y-auto max-h-[420px] pr-1">
           {filtered.map(biz => (
             <div key={biz.id}
-              onClick={() => { setSelected(biz); mapRef.current?.panTo({ lat: biz.lat, lng: biz.lng }) }}
+              onClick={() => handleListClick(biz)}
               className={`bg-white rounded-xl p-4 border cursor-pointer transition-all hover:shadow-md
                 ${selected?.id === biz.id ? 'border-brand-400 shadow-md' : 'border-gray-100'}`}>
               <div className="flex items-start gap-3">
@@ -211,10 +214,7 @@ export default function MapPanel() {
                 <div className="flex-1 min-w-0">
                   <p className="font-semibold text-gray-900 text-sm truncate">{biz.name}</p>
                   <p className="text-gray-400 text-xs">{biz.type}</p>
-                  <div className="flex items-center gap-1 mt-1">
-                    <span className="text-yellow-400 text-xs">★</span>
-                    <span className="text-xs text-gray-500">{biz.rating}</span>
-                  </div>
+                  <p className="text-xs mt-1">⭐ {biz.rating}</p>
                   {biz.promo && (
                     <p className="text-xs text-green-600 font-medium mt-1.5 bg-green-50 px-2 py-0.5 rounded-full inline-block">
                       🎁 {biz.promo}
@@ -231,7 +231,7 @@ export default function MapPanel() {
       <div>
         <h3 className="font-semibold text-gray-800 mb-3">Active Local Promotions</h3>
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-          {activePromos.map(biz => (
+          {businesses.filter(b => b.promo).map(biz => (
             <div key={biz.id}
               className="bg-gradient-to-br from-brand-50 to-indigo-50 border border-brand-100 rounded-xl p-4">
               <div className="flex items-center gap-2 mb-2">
